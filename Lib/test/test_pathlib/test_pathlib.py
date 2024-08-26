@@ -1,3 +1,4 @@
+import contextlib
 import io
 import os
 import sys
@@ -23,9 +24,17 @@ from test.test_pathlib import test_pathlib_abc
 from test.test_pathlib.test_pathlib_abc import needs_posix, needs_windows, needs_symlinks
 
 try:
+    import fcntl
+except ImportError:
+    fcntl = None
+try:
     import grp, pwd
 except ImportError:
     grp = pwd = None
+try:
+    import posix
+except ImportError:
+    posix = None
 
 
 root_in_posix = False
@@ -35,6 +44,19 @@ if hasattr(os, 'geteuid'):
 delete_use_fd_functions = (
     {os.open, os.stat, os.unlink, os.rmdir} <= os.supports_dir_fd and
     os.listdir in os.supports_fd and os.stat in os.supports_follow_symlinks)
+
+def patch_replace(old_test):
+    def new_replace(self, target):
+        raise OSError(errno.EXDEV, "Cross-device link", self, target)
+
+    def new_test(self):
+        old_replace = self.cls.replace
+        self.cls.replace = new_replace
+        try:
+            old_test(self)
+        finally:
+            self.cls.replace = old_replace
+    return new_test
 
 #
 # Tests for the pure classes.
@@ -707,6 +729,45 @@ class PathTest(test_pathlib_abc.DummyPathTest, PurePathTest):
         if hasattr(source_st, 'st_flags'):
             self.assertEqual(source_st.st_flags, target_st.st_flags)
 
+    def test_copy_error_handling(self):
+        def make_raiser(err):
+            def raiser(*args, **kwargs):
+                raise OSError(err, os.strerror(err))
+            return raiser
+
+        base = self.cls(self.base)
+        source = base / 'fileA'
+        target = base / 'copyA'
+
+        # Raise non-fatal OSError from all available fast copy functions.
+        with contextlib.ExitStack() as ctx:
+            if fcntl and hasattr(fcntl, 'FICLONE'):
+                ctx.enter_context(mock.patch('fcntl.ioctl', make_raiser(errno.EXDEV)))
+            if posix and hasattr(posix, '_fcopyfile'):
+                ctx.enter_context(mock.patch('posix._fcopyfile', make_raiser(errno.ENOTSUP)))
+            if hasattr(os, 'copy_file_range'):
+                ctx.enter_context(mock.patch('os.copy_file_range', make_raiser(errno.EXDEV)))
+            if hasattr(os, 'sendfile'):
+                ctx.enter_context(mock.patch('os.sendfile', make_raiser(errno.ENOTSOCK)))
+
+            source.copy(target)
+            self.assertTrue(target.exists())
+            self.assertEqual(source.read_text(), target.read_text())
+
+        # Raise fatal OSError from first available fast copy function.
+        if fcntl and hasattr(fcntl, 'FICLONE'):
+            patchpoint = 'fcntl.ioctl'
+        elif posix and hasattr(posix, '_fcopyfile'):
+            patchpoint = 'posix._fcopyfile'
+        elif hasattr(os, 'copy_file_range'):
+            patchpoint = 'os.copy_file_range'
+        elif hasattr(os, 'sendfile'):
+            patchpoint = 'os.sendfile'
+        else:
+            return
+        with mock.patch(patchpoint, make_raiser(errno.ENOENT)):
+            self.assertRaises(FileNotFoundError, source.copy, target)
+
     @unittest.skipIf(sys.platform == "win32" or sys.platform == "wasi", "directories are always readable on Windows and WASI")
     @unittest.skipIf(root_in_posix, "test fails with root privilege")
     def test_copy_dir_no_read_permission(self):
@@ -750,6 +811,55 @@ class PathTest(test_pathlib_abc.DummyPathTest, PurePathTest):
         source.copy(target, preserve_metadata=True)
         target_file = target.joinpath('dirD', 'fileD')
         self.assertEqual(os.getxattr(target_file, b'user.foo'), b'42')
+
+    @patch_replace
+    def test_move_file_other_fs(self):
+        self.test_move_file()
+
+    @patch_replace
+    def test_move_file_to_file_other_fs(self):
+        self.test_move_file_to_file()
+
+    @patch_replace
+    def test_move_file_to_dir_other_fs(self):
+        self.test_move_file_to_dir()
+
+    @patch_replace
+    def test_move_dir_other_fs(self):
+        self.test_move_dir()
+
+    @patch_replace
+    def test_move_dir_to_dir_other_fs(self):
+        self.test_move_dir_to_dir()
+
+    @patch_replace
+    def test_move_dir_into_itself_other_fs(self):
+        self.test_move_dir_into_itself()
+
+    @patch_replace
+    @needs_symlinks
+    def test_move_file_symlink_other_fs(self):
+        self.test_move_file_symlink()
+
+    @patch_replace
+    @needs_symlinks
+    def test_move_file_symlink_to_itself_other_fs(self):
+        self.test_move_file_symlink_to_itself()
+
+    @patch_replace
+    @needs_symlinks
+    def test_move_dir_symlink_other_fs(self):
+        self.test_move_dir_symlink()
+
+    @patch_replace
+    @needs_symlinks
+    def test_move_dir_symlink_to_itself_other_fs(self):
+        self.test_move_dir_symlink_to_itself()
+
+    @patch_replace
+    @needs_symlinks
+    def test_move_dangling_symlink_other_fs(self):
+        self.test_move_dangling_symlink()
 
     def test_resolve_nonexist_relative_issue38671(self):
         p = self.cls('non', 'exist')
