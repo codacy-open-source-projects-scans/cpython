@@ -88,7 +88,6 @@ typedef struct _PyCompiler {
                                     including names tuple */
     struct compiler_unit *u;     /* compiler state for current block */
     PyObject *c_stack;           /* Python list holding compiler_unit ptrs */
-    PyArena *c_arena;            /* pointer to memory allocation arena */
 
     bool c_save_nested_seqs;     /* if true, construct recursive instruction sequences
                                   * (including instructions for nested code objects)
@@ -112,7 +111,6 @@ compiler_setup(compiler *c, mod_ty mod, PyObject *filename,
     }
 
     c->c_filename = Py_NewRef(filename);
-    c->c_arena = arena;
     if (!_PyFuture_FromAST(mod, filename, &c->c_future)) {
         return ERROR;
     }
@@ -792,13 +790,13 @@ compiler_codegen(compiler *c, mod_ty mod)
     switch (mod->kind) {
     case Module_kind: {
         asdl_stmt_seq *stmts = mod->v.Module.body;
-        RETURN_IF_ERROR(_PyCodegen_Body(c, start_location(stmts), stmts));
+        RETURN_IF_ERROR(_PyCodegen_Body(c, start_location(stmts), stmts, false));
         break;
     }
     case Interactive_kind: {
         c->c_interactive = 1;
         asdl_stmt_seq *stmts = mod->v.Interactive.body;
-        RETURN_IF_ERROR(_PyCodegen_Body(c, start_location(stmts), stmts));
+        RETURN_IF_ERROR(_PyCodegen_Body(c, start_location(stmts), stmts, true));
         break;
     }
     case Expression_kind: {
@@ -1114,27 +1112,15 @@ _PyCompile_Error(compiler *c, location loc, const char *format, ...)
     if (msg == NULL) {
         return ERROR;
     }
-    PyObject *loc_obj = PyErr_ProgramTextObject(c->c_filename, loc.lineno);
-    if (loc_obj == NULL) {
-        loc_obj = Py_None;
-    }
-    PyObject *args = Py_BuildValue("O(OiiOii)", msg, c->c_filename,
-                                   loc.lineno, loc.col_offset + 1, loc_obj,
-                                   loc.end_lineno, loc.end_col_offset + 1);
+    _PyErr_RaiseSyntaxError(msg, c->c_filename, loc.lineno, loc.col_offset + 1,
+                            loc.end_lineno, loc.end_col_offset + 1);
     Py_DECREF(msg);
-    if (args == NULL) {
-        goto exit;
-    }
-    PyErr_SetObject(PyExc_SyntaxError, args);
- exit:
-    Py_DECREF(loc_obj);
-    Py_XDECREF(args);
     return ERROR;
 }
 
-/* Emits a SyntaxWarning and returns 1 on success.
+/* Emits a SyntaxWarning and returns 0 on success.
    If a SyntaxWarning raised as error, replaces it with a SyntaxError
-   and returns 0.
+   and returns -1.
 */
 int
 _PyCompile_Warn(compiler *c, location loc, const char *format, ...)
@@ -1146,21 +1132,10 @@ _PyCompile_Warn(compiler *c, location loc, const char *format, ...)
     if (msg == NULL) {
         return ERROR;
     }
-    if (PyErr_WarnExplicitObject(PyExc_SyntaxWarning, msg, c->c_filename,
-                                 loc.lineno, NULL, NULL) < 0)
-    {
-        if (PyErr_ExceptionMatches(PyExc_SyntaxWarning)) {
-            /* Replace the SyntaxWarning exception with a SyntaxError
-               to get a more accurate error report */
-            PyErr_Clear();
-            assert(PyUnicode_AsUTF8(msg) != NULL);
-            _PyCompile_Error(c, loc, PyUnicode_AsUTF8(msg));
-        }
-        Py_DECREF(msg);
-        return ERROR;
-    }
+    int ret = _PyErr_EmitSyntaxWarning(msg, c->c_filename, loc.lineno, loc.col_offset + 1,
+                                       loc.end_lineno, loc.end_col_offset + 1);
     Py_DECREF(msg);
-    return SUCCESS;
+    return ret;
 }
 
 PyObject *
@@ -1206,17 +1181,12 @@ _PyCompile_OptimizationLevel(compiler *c)
 }
 
 int
-_PyCompile_IsInteractive(compiler *c)
-{
-    return c->c_interactive;
-}
-
-int
-_PyCompile_IsNestedScope(compiler *c)
+_PyCompile_IsInteractiveTopLevel(compiler *c)
 {
     assert(c->c_stack != NULL);
     assert(PyList_CheckExact(c->c_stack));
-    return PyList_GET_SIZE(c->c_stack) > 0;
+    bool is_nested_scope = PyList_GET_SIZE(c->c_stack) > 0;
+    return c->c_interactive && !is_nested_scope;
 }
 
 int
@@ -1243,21 +1213,6 @@ _PyCompile_Metadata(compiler *c)
 {
     return &c->u->u_metadata;
 }
-
-PyArena *
-_PyCompile_Arena(compiler *c)
-{
-    return c->c_arena;
-}
-
-#ifndef NDEBUG
-int
-_PyCompile_IsTopLevelAwait(compiler *c)
-{
-    return c->c_flags.cf_flags & PyCF_ALLOW_TOP_LEVEL_AWAIT &&
-           c->u->u_ste->ste_type == ModuleBlock;
-}
-#endif
 
 // Merge *obj* with constant cache, without recursion.
 int
