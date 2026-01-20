@@ -8,10 +8,11 @@ extern "C" {
 #  error "this header requires Py_BUILD_CORE define"
 #endif
 
+#include <stdbool.h>
 #include "pycore_uop.h"  // UOP_MAX_TRACE_LENGTH
 
-// Holds locals, stack, locals, stack ... co_consts (in that order)
-#define MAX_ABSTRACT_INTERP_SIZE 4096
+// Holds locals, stack, locals, stack ... (in that order)
+#define MAX_ABSTRACT_INTERP_SIZE 512
 
 #define TY_ARENA_SIZE (UOP_MAX_TRACE_LENGTH * 5)
 
@@ -128,6 +129,8 @@ typedef struct _JitOptContext {
     JitOptRef *n_consumed;
     JitOptRef *limit;
     JitOptRef locals_and_stack[MAX_ABSTRACT_INTERP_SIZE];
+    _PyUOpInstruction *out_buffer;
+    int out_len;
 } JitOptContext;
 
 
